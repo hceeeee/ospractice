@@ -16,16 +16,21 @@ static inline uint64_t r_sip(void){ uint64_t x; asm volatile("csrr %0, sip" : "=
 static inline void     w_sip(uint64_t x){ asm volatile("csrw sip, %0" :: "r"(x)); }
 static inline uint64_t r_time(void){ uint64_t x; asm volatile("rdtime %0":"=r"(x)); return x; }
 
-// ---------------- SSTATUS/SIE bits ----------------
+// ---------------- SSTATUS/SIE/SIP bits ----------------
 #define SSTATUS_SIE   (1UL << 1)   // global S-mode interrupt enable
 #define SIE_SEIE      (1UL << 9)   // external
 #define SIE_STIE      (1UL << 5)   // timer
 #define SIE_SSIE      (1UL << 1)   // software
+#define SIP_SEIP      (1UL << 9)
+#define SIP_STIP      (1UL << 5)
+#define SIP_SSIP      (1UL << 1)
 
 // ---------------- scause decoding ----------------
-#define SCAUSE_INTR_MASK   (1ULL << 63)
-#define SCAUSE_CODE(x)     ((x) & 0xfffULL)
-#define SCAUSE_SUPERVISOR_TIMER 5  // when interrupt bit set and code==5
+#define SCAUSE_INTR_MASK            (1ULL << 63)
+#define SCAUSE_CODE(x)              ((x) & 0xfffULL)
+#define SCAUSE_SUPERVISOR_SOFTWARE  1
+#define SCAUSE_SUPERVISOR_TIMER     5
+#define SCAUSE_SUPERVISOR_EXTERNAL  9
 
 // ---------------- convenience ----------------
 static inline void intr_on(void){ w_sstatus(r_sstatus() | SSTATUS_SIE); }
