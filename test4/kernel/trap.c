@@ -2,111 +2,207 @@
 #include "riscv.h"
 #include "sbi.h"
 #include "trap.h"
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
-// ---------------- 中断向量表（简化：按 scause code 编号） ----------------
 #define MAX_IRQ 64
+
 static interrupt_handler_t ivt[MAX_IRQ];
+static volatile uint64_t ticks = 0;
+volatile int interrupt_count = 0;
 
-static volatile int ticks = 0;           // 全局时钟节拍计数（可用于调度片）
-volatile int interrupt_count = 0;        // 供测试打印使用
+static const int irq_priority[] = {
+    SCAUSE_SUPERVISOR_TIMER,
+    SCAUSE_SUPERVISOR_EXTERNAL,
+    SCAUSE_SUPERVISOR_SOFTWARE,
+};
 
-// ---------------- 对外 API ----------------
-void register_interrupt(int irq, interrupt_handler_t h){
-  if(irq >=0 && irq < MAX_IRQ) ivt[irq] = h;
+extern bool should_yield(void);
+extern void yield(void);
+
+static inline bool valid_irq(int irq) {
+  return irq >= 0 && irq < MAX_IRQ;
 }
 
-void enable_interrupt(int irq){
-  // 我们只按位打开 sie 的三类：软件/时钟/外部。细粒度来源的 enable 放到设备驱动各自做。
+static inline uint64_t irq_to_sie_bit(int irq) {
+  switch (irq) {
+    case SCAUSE_SUPERVISOR_SOFTWARE:
+      return SIE_SSIE;
+    case SCAUSE_SUPERVISOR_TIMER:
+      return SIE_STIE;
+    case SCAUSE_SUPERVISOR_EXTERNAL:
+      return SIE_SEIE;
+    default:
+      return 0;
+  }
+}
+
+static inline uint64_t irq_to_sip_bit(int irq) {
+  switch (irq) {
+    case SCAUSE_SUPERVISOR_SOFTWARE:
+      return SIP_SSIP;
+    case SCAUSE_SUPERVISOR_TIMER:
+      return SIP_STIP;
+    case SCAUSE_SUPERVISOR_EXTERNAL:
+      return SIP_SEIP;
+    default:
+      return 0;
+  }
+}
+
+static bool dispatch_irq(int irq) {
+  if (!valid_irq(irq)) {
+    return false;
+  }
+  interrupt_handler_t handler = ivt[irq];
+  if (handler) {
+    handler();
+    return true;
+  }
+  return false;
+}
+
+static int choose_irq(uint64_t scause) {
+  if ((scause & SCAUSE_INTR_MASK) == 0) {
+    return -1;
+  }
+
+  const int cause = (int)SCAUSE_CODE(scause);
+  const uint64_t pending = r_sip() & r_sie();
+  const uint64_t cause_mask = irq_to_sip_bit(cause);
+
+  if (cause_mask && (pending & cause_mask)) {
+    return cause;
+  }
+
+  for (size_t i = 0; i < sizeof(irq_priority) / sizeof(irq_priority[0]); ++i) {
+    const int candidate = irq_priority[i];
+    const uint64_t mask = irq_to_sip_bit(candidate);
+    if (mask && (pending & mask)) {
+      return candidate;
+    }
+  }
+
+  return valid_irq(cause) ? cause : -1;
+}
+
+void register_interrupt(int irq, interrupt_handler_t handler) {
+  if (valid_irq(irq)) {
+    ivt[irq] = handler;
+  }
+}
+
+void unregister_interrupt(int irq) {
+  if (valid_irq(irq)) {
+    ivt[irq] = NULL;
+  }
+}
+
+void enable_interrupt(int irq) {
+  const uint64_t mask = irq_to_sie_bit(irq);
+  if (!mask) {
+    return;
+  }
   uint64_t sie = r_sie();
-  if(irq == SCAUSE_SUPERVISOR_TIMER) sie |= SIE_STIE;
-  // 你可扩展：外部中断 SIE_SEIE、软件中断 SIE_SSIE
+  sie |= mask;
   w_sie(sie);
 }
 
-void disable_interrupt(int irq){
+void disable_interrupt(int irq) {
+  const uint64_t mask = irq_to_sie_bit(irq);
+  if (!mask) {
+    return;
+  }
   uint64_t sie = r_sie();
-  if(irq == SCAUSE_SUPERVISOR_TIMER) sie &= ~SIE_STIE;
+  sie &= ~mask;
   w_sie(sie);
 }
 
-uint64_t get_time(void){
-  return r_time(); // 直接读 time CSR
+uint64_t get_time(void) {
+  return r_time();
 }
 
-// ---------------- 时钟处理与 tick 设置 ----------------
-#define TIMEBASE_HZ 10000000ULL   // QEMU virt 常见 10 MHz（如有不同请按平台改）
-#define HZ          100           // 100Hz 调度时钟
+#define TIMEBASE_HZ 10000000ULL
+#define HZ          100ULL
 #define TICK_CYCLES (TIMEBASE_HZ / HZ)
 
-static void set_next_timer(void){
-  uint64_t now = get_time();
+static void set_next_timer(void) {
+  const uint64_t now = get_time();
   sbi_set_timer(now + TICK_CYCLES);
 }
 
-void timer_interrupt(void){
-  // 1. 更新内核时间
-  ticks++;
-  interrupt_count++;   // 供测试
+void timer_interrupt(void) {
+  ++ticks;
+  ++interrupt_count;
 
-  // 2. TODO: 定时器事件处理（超时队列等）
+  if (should_yield()) {
+    yield();
+  }
 
-  // 3. 触发调度（占位：可按片轮转、优先级等）
-  // if (should_yield()) yield();
-
-  // 4. 预约下次中断
   set_next_timer();
 }
 
-// ---------------- 陷入初始化 ----------------
 extern void kernelvec(void);
 
-void trap_init(void){
-  // 设置 S 态陷阱入口为 kernelvec
+void trap_init(void) {
+  intr_off();
+  for (int i = 0; i < MAX_IRQ; ++i) {
+    ivt[i] = NULL;
+  }
+  ticks = 0;
+  interrupt_count = 0;
+
+  w_sip(r_sip() & ~(SIP_SSIP | SIP_STIP | SIP_SEIP));
   w_stvec((uint64_t)kernelvec);
 
-  // 启用定时中断（外加全局中断位）
-  enable_interrupt(SCAUSE_SUPERVISOR_TIMER);
-  intr_on();
-
-  // 设置第一次时钟
-  set_next_timer();
-
-  // 注册时钟中断 handler（可选：也可在 devintr 里直接调用）
   register_interrupt(SCAUSE_SUPERVISOR_TIMER, timer_interrupt);
+  enable_interrupt(SCAUSE_SUPERVISOR_TIMER);
+
+  set_next_timer();
+  intr_on();
 }
 
-// ---------------- 内核陷入/分发逻辑 ----------------
-int devintr(void){
-  uint64_t sc = r_scause();
-  if ((sc & SCAUSE_INTR_MASK) && SCAUSE_CODE(sc) == SCAUSE_SUPERVISOR_TIMER) {
-    // 调用 IVT（若已注册），否则默认处理
-    if (ivt[SCAUSE_SUPERVISOR_TIMER])
-      ivt[SCAUSE_SUPERVISOR_TIMER]();
-    else
-      timer_interrupt();
+int devintr(struct trapframe *tf) {
+  const int irq = choose_irq(tf->scause);
+  if (irq < 0) {
+    return 0;
+  }
+  if (dispatch_irq(irq)) {
     return 1;
   }
-  // TODO: 外部中断、软件中断、串口……
   return 0;
 }
 
-void kerneltrap(void){
-  // 这里处于 S 态，来自内核态或用户态的陷入；我们仅处理中断，异常简单打印
-  uint64_t sc = r_scause();
-  if (sc & SCAUSE_INTR_MASK) {
-    if(!devintr()){
-      // 未识别的中断
-      // 可以加调试输出
+void kerneltrap(struct trapframe *tf) {
+  tf->sepc = r_sepc();
+  tf->sstatus = r_sstatus();
+  tf->stval = r_stval();
+  tf->scause = r_scause();
+  tf->reserved = 0;
+
+  if (tf->sstatus & SSTATUS_SIE) {
+    printf("kerneltrap: interrupts enabled\n");
+  }
+
+  if (tf->scause & SCAUSE_INTR_MASK) {
+    if (!devintr(tf)) {
+      printf("kerneltrap: unexpected interrupt cause=%lu\n",
+             (unsigned long)SCAUSE_CODE(tf->scause));
     }
   } else {
-    // 异常：比如非法访问/页错误等
-    // 先简单处理：跳过或打印
-    // 在教学阶段你可以 uart_puts/printf 定位问题
+    printf("kerneltrap: unexpected exception scause=%lu sepc=%#lx stval=%#lx\n",
+           (unsigned long)tf->scause,
+           (unsigned long)tf->sepc,
+           (unsigned long)tf->stval);
+    while (1) {
+      asm volatile("wfi");
+    }
   }
+
+  w_sepc(tf->sepc);
 }
 
-void usertrap(void){
-  // 需要用户态支持/切换，这里留空或重用 kerneltrap
-  kerneltrap();
+void usertrap(struct trapframe *tf) {
+  kerneltrap(tf);
 }

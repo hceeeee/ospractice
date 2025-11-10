@@ -1,9 +1,8 @@
 // kernel/main.c
-#include <stdio.h>
-#include <stdint.h>
 #include "trap.h"
+#include <stdint.h>
+#include <stdio.h>
 
-// 你给的测试函数（略微改为可编译）
 void test_timer_interrupt(void) {
   printf("Testing timer interrupt...\n");
 
@@ -16,8 +15,9 @@ void test_timer_interrupt(void) {
       printf("Waiting for interrupt %d...\n", interrupt_count + 1);
       last = interrupt_count;
     }
-    // 简单忙等
-    for (volatile int i = 0; i < 100000; i++);
+    for (volatile int i = 0; i < 100000; i++) {
+      __asm__ volatile("");
+    }
   }
 
   uint64_t end_time = get_time();
@@ -25,9 +25,11 @@ void test_timer_interrupt(void) {
          interrupt_count, (unsigned long)(end_time - start_time));
 }
 
-void kmain(void){
+void kmain(void) {
   printf("Kernel start.\n");
   test_timer_interrupt();
   printf("Done. Entering WFI loop.\n");
-  for(;;) asm volatile("wfi");
+  for (;;) {
+    asm volatile("wfi");
+  }
 }
